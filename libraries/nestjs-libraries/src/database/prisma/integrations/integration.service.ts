@@ -1,27 +1,33 @@
-import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
+import {
+  forwardRef,
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+} from '@nestjs/common';
 import { IntegrationRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.repository';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
-import { InstagramProvider } from '@gitroom/nestjs-libraries/integrations/social/instagram.provider';
-import { FacebookProvider } from '@gitroom/nestjs-libraries/integrations/social/facebook.provider';
 import {
   AnalyticsData,
-  AuthTokenDetails,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { Integration, Organization } from '@prisma/client';
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
-import { LinkedinPageProvider } from '@gitroom/nestjs-libraries/integrations/social/linkedin.page.provider';
 import dayjs from 'dayjs';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
-import { RefreshToken } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  NotEnoughScopes,
+  RefreshToken,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { PlugDto } from '@gitroom/nestjs-libraries/dtos/plugs/plug.dto';
-import { BullMqClient } from '@gitroom/nestjs-libraries/bull-mq-transport-new/client';
 import { difference, uniq } from 'lodash';
 import utc from 'dayjs/plugin/utc';
 import { AutopostRepository } from '@gitroom/nestjs-libraries/database/prisma/autopost/autopost.repository';
+import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
+import { TemporalService } from 'nestjs-temporal-core';
 
 dayjs.extend(utc);
 
@@ -33,14 +39,18 @@ export class IntegrationService {
     private _autopostsRepository: AutopostRepository,
     private _integrationManager: IntegrationManager,
     private _notificationService: NotificationService,
-    private _workerServiceProducer: BullMqClient
+    @Inject(forwardRef(() => RefreshIntegrationService))
+    private _refreshIntegrationService: RefreshIntegrationService,
+    private _temporalService: TemporalService
   ) {}
 
   async changeActiveCron(orgId: string) {
     const data = await this._autopostsRepository.getAutoposts(orgId);
 
     for (const item of data.filter((f) => f.active)) {
-      await this._workerServiceProducer.deleteScheduler('cron', item.id);
+      try {
+        await this._temporalService.terminateWorkflow(`autopost-${item.id}`);
+      } catch (err) {}
     }
 
     return true;
@@ -106,7 +116,10 @@ export class IntegrationService {
     const uploadedPicture = picture
       ? picture?.indexOf('imagedelivery.net') > -1
         ? picture
-        : await this.storage.uploadSimple(picture)
+        : await this.storage.uploadSimple(picture).catch((err) => {
+            console.log('Failed to upload profile picture:', picture, err);
+            return undefined;
+          })
       : undefined;
 
     return this._integrationRepository.createOrUpdateIntegration(
@@ -173,9 +186,116 @@ export class IntegrationService {
     }
   }
 
-  async disconnectChannel(orgId: string, integration: Integration) {
+  async disconnectChannel(orgId: string, integration: Integration, err = '') {
     await this._integrationRepository.disconnectChannel(orgId, integration.id);
-    await this.informAboutRefreshError(orgId, integration);
+    await this.informAboutRefreshError(orgId, integration, err);
+  }
+
+  // A reconnect that came back from a different provider (MIGRATE_PROVIDERS):
+  // match the disconnected channel by profile and move it to the new provider
+  // in place, so scheduled posts, settings and customers survive. Throws the
+  // same error as a mismatched reconnect when the migration is not configured
+  // or the user connected a different account.
+  async migrateIntegration(
+    org: string,
+    oldInternalId: string,
+    newProvider: string,
+    auth: { id: string; username: string }
+  ) {
+    const existing = await this._integrationRepository.getIntegrationByInternalId(
+      org,
+      oldInternalId
+    );
+
+    if (
+      !existing ||
+      this._integrationManager.getMigrationTarget(
+        existing.providerIdentifier
+      ) !== newProvider
+    ) {
+      throw new NotEnoughScopes(
+        'Please refresh the channel that needs to be refreshed'
+      );
+    }
+
+    const oldProvider = this._integrationManager.getSocialIntegration(
+      existing.providerIdentifier
+    );
+
+    if (!oldProvider.migrationMatch(auth, existing)) {
+      throw new NotEnoughScopes(
+        `Please connect the same account (@${existing.profile}) that needs to be refreshed`
+      );
+    }
+
+    if (
+      await this._integrationRepository.getIntegrationByInternalId(org, auth.id)
+    ) {
+      throw new NotEnoughScopes(
+        'This account is already connected as another channel, please delete one of them first'
+      );
+    }
+
+    return this._integrationRepository.migrateIntegration(
+      org,
+      existing.id,
+      auth.id,
+      newProvider,
+      existing.rootInternalId === existing.internalId
+        ? auth.id
+        : existing.rootInternalId
+    );
+  }
+
+  // A fresh connect of a migration target (MIGRATE_PROVIDERS) for an account
+  // the org already has on the source provider: adopt that channel instead of
+  // creating a confusing duplicate - the channel is migrated in place exactly
+  // like a reconnect, and the follow-up upsert stores the fresh tokens. A no-op
+  // when nothing matches, so a genuinely new account still creates a channel.
+  async migrateIntegrationOnConnect(
+    org: string,
+    newProvider: string,
+    auth: { id: string; username: string }
+  ) {
+    const sources = this._integrationManager.getMigrationSources(newProvider);
+    if (
+      !sources.length ||
+      this._integrationManager.getSocialIntegration(newProvider).isBetweenSteps
+    ) {
+      return;
+    }
+
+    // the account already exists on the new provider: the normal upsert
+    // updates it, nothing to adopt
+    if (
+      await this._integrationRepository.getIntegrationByInternalId(org, auth.id)
+    ) {
+      return;
+    }
+
+    const existing = (
+      await this._integrationRepository.getIntegrationsList(org)
+    ).find(
+      (p) =>
+        sources.includes(p.providerIdentifier) &&
+        this._integrationManager
+          .getSocialIntegration(p.providerIdentifier)
+          .migrationMatch(auth, p)
+    );
+
+    if (!existing) {
+      return;
+    }
+
+    return this._integrationRepository.migrateIntegration(
+      org,
+      existing.id,
+      auth.id,
+      newProvider,
+      existing.rootInternalId === existing.internalId
+        ? auth.id
+        : existing.rootInternalId
+    );
   }
 
   async informAboutRefreshError(
@@ -187,12 +307,18 @@ export class IntegrationService {
       orgId,
       `Could not refresh your ${integration.providerIdentifier} channel ${err}`,
       `Could not refresh your ${integration.providerIdentifier} channel ${err}. Please go back to the system and connect it again ${process.env.FRONTEND_URL}/launches`,
-      true
+      true,
+      false,
+      'info'
     );
   }
 
   async refreshNeeded(org: string, id: string) {
     return this._integrationRepository.refreshNeeded(org, id);
+  }
+
+  async setBetweenRefreshSteps(id: string) {
+    return this._integrationRepository.setBetweenRefreshSteps(id);
   }
 
   async refreshTokens() {
@@ -268,96 +394,42 @@ export class IntegrationService {
     return this._integrationRepository.checkForDeletedOnceAndUpdate(org, page);
   }
 
-  async saveInstagram(
-    org: string,
-    id: string,
-    data: { pageId: string; id: string }
-  ) {
+  async saveProviderPage(org: string, id: string, data: any) {
     const getIntegration = await this._integrationRepository.getIntegrationById(
       org,
       id
     );
-    if (getIntegration && !getIntegration.inBetweenSteps) {
+    if (!getIntegration) {
+      throw new HttpException('Integration not found', HttpStatus.NOT_FOUND);
+    }
+    if (!getIntegration.inBetweenSteps) {
       throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
     }
 
-    const instagram = this._integrationManager.getSocialIntegration(
-      'instagram'
-    ) as InstagramProvider;
-    const getIntegrationInformation = await instagram.fetchPageInformation(
-      getIntegration?.token!,
+    const provider = this._integrationManager.getSocialIntegration(
+      getIntegration.providerIdentifier
+    );
+
+    if (!provider.fetchPageInformation) {
+      throw new HttpException(
+        'Provider does not support page selection',
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    const getIntegrationInformation = await provider.fetchPageInformation(
+      getIntegration.token,
       data
-    );
-
-    await this.checkForDeletedOnceAndUpdate(org, getIntegrationInformation.id);
-    await this._integrationRepository.updateIntegration(id, {
-      picture: getIntegrationInformation.picture,
-      internalId: getIntegrationInformation.id,
-      name: getIntegrationInformation.name,
-      inBetweenSteps: false,
-      token: getIntegrationInformation.access_token,
-      profile: getIntegrationInformation.username,
-    });
-
-    return { success: true };
-  }
-
-  async saveLinkedin(org: string, id: string, page: string) {
-    const getIntegration = await this._integrationRepository.getIntegrationById(
-      org,
-      id
-    );
-    if (getIntegration && !getIntegration.inBetweenSteps) {
-      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
-    }
-
-    const linkedin = this._integrationManager.getSocialIntegration(
-      'linkedin-page'
-    ) as LinkedinPageProvider;
-
-    const getIntegrationInformation = await linkedin.fetchPageInformation(
-      getIntegration?.token!,
-      page
     );
 
     await this.checkForDeletedOnceAndUpdate(
       org,
       String(getIntegrationInformation.id)
     );
-
-    await this._integrationRepository.updateIntegration(String(id), {
-      picture: getIntegrationInformation.picture,
-      internalId: String(getIntegrationInformation.id),
-      name: getIntegrationInformation.name,
-      inBetweenSteps: false,
-      token: getIntegrationInformation.access_token,
-      profile: getIntegrationInformation.username,
-    });
-
-    return { success: true };
-  }
-
-  async saveFacebook(org: string, id: string, page: string) {
-    const getIntegration = await this._integrationRepository.getIntegrationById(
-      org,
-      id
-    );
-    if (getIntegration && !getIntegration.inBetweenSteps) {
-      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
-    }
-
-    const facebook = this._integrationManager.getSocialIntegration(
-      'facebook'
-    ) as FacebookProvider;
-    const getIntegrationInformation = await facebook.fetchPageInformation(
-      getIntegration?.token!,
-      page
-    );
-
-    await this.checkForDeletedOnceAndUpdate(org, getIntegrationInformation.id);
     await this._integrationRepository.updateIntegration(id, {
       picture: getIntegrationInformation.picture,
-      internalId: getIntegrationInformation.id,
+      internalId: String(getIntegrationInformation.id),
+      organizationId: org,
       name: getIntegrationInformation.name,
       inBetweenSteps: false,
       token: getIntegrationInformation.access_token,
@@ -391,39 +463,16 @@ export class IntegrationService {
       dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) ||
       forceRefresh
     ) {
-      const { accessToken, expiresIn, refreshToken, additionalSettings } =
-        await new Promise<AuthTokenDetails>((res) => {
-          return integrationProvider
-            .refreshToken(getIntegration.refreshToken!)
-            .then((r) => res(r))
-            .catch(() => {
-              res({
-                error: '',
-                accessToken: '',
-                id: '',
-                name: '',
-                picture: '',
-                username: '',
-                additionalSettings: undefined,
-              });
-            });
-        });
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+      if (!data) {
+        return [];
+      }
+
+      const { accessToken } = data;
 
       if (accessToken) {
-        await this.createOrUpdateIntegration(
-          additionalSettings,
-          !!integrationProvider.oneTimeToken,
-          getIntegration.organizationId,
-          getIntegration.name,
-          getIntegration.picture!,
-          'social',
-          getIntegration.internalId,
-          getIntegration.providerIdentifier,
-          accessToken,
-          refreshToken,
-          expiresIn
-        );
-
         getIntegration.token = accessToken;
 
         if (integrationProvider.refreshWait) {
@@ -518,78 +567,15 @@ export class IntegrationService {
       getIntegration.providerIdentifier
     );
 
-    if (
-      dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) ||
-      forceRefresh
-    ) {
-      const { accessToken, expiresIn, refreshToken, additionalSettings } =
-        await new Promise<AuthTokenDetails>((res) => {
-          getSocialIntegration
-            .refreshToken(getIntegration.refreshToken!)
-            .then((r) => res(r))
-            .catch(() =>
-              res({
-                accessToken: '',
-                expiresIn: 0,
-                refreshToken: '',
-                id: '',
-                name: '',
-                username: '',
-                picture: '',
-                additionalSettings: undefined,
-              })
-            );
-        });
+    // @ts-ignore
+    await getSocialIntegration?.[getAllInternalPlugs.methodName]?.(
+      getIntegration,
+      originalIntegration,
+      data.post,
+      data.information
+    );
 
-      if (!accessToken) {
-        await this.refreshNeeded(
-          getIntegration.organizationId,
-          getIntegration.id
-        );
-
-        await this.informAboutRefreshError(
-          getIntegration.organizationId,
-          getIntegration
-        );
-        return {};
-      }
-
-      await this.createOrUpdateIntegration(
-        additionalSettings,
-        !!getSocialIntegration.oneTimeToken,
-        getIntegration.organizationId,
-        getIntegration.name,
-        getIntegration.picture!,
-        'social',
-        getIntegration.internalId,
-        getIntegration.providerIdentifier,
-        accessToken,
-        refreshToken,
-        expiresIn
-      );
-
-      getIntegration.token = accessToken;
-
-      if (getSocialIntegration.refreshWait) {
-        await timer(10000);
-      }
-    }
-
-    try {
-      // @ts-ignore
-      await getSocialIntegration?.[getAllInternalPlugs.methodName]?.(
-        getIntegration,
-        originalIntegration,
-        data.post,
-        data.information
-      );
-    } catch (err) {
-      if (err instanceof RefreshToken) {
-        return this.processInternalPlug(data, true);
-      }
-
-      return;
-    }
+    return;
   }
 
   async processPlugs(data: {
@@ -601,18 +587,12 @@ export class IntegrationService {
   }) {
     const getPlugById = await this._integrationRepository.getPlug(data.plugId);
     if (!getPlugById) {
-      return;
+      return true;
     }
 
     const integration = this._integrationManager.getSocialIntegration(
       getPlugById.integration.providerIdentifier
     );
-
-    const findPlug = this._integrationManager
-      .getAllPlugs()
-      .find(
-        (p) => p.identifier === getPlugById.integration.providerIdentifier
-      )!;
 
     // @ts-ignore
     const process = await integration[getPlugById.plugFunction](
@@ -625,26 +605,14 @@ export class IntegrationService {
     );
 
     if (process) {
-      return;
+      return true;
     }
 
     if (data.totalRuns === data.currentRun) {
-      return;
+      return true;
     }
 
-    this._workerServiceProducer.emit('plugs', {
-      id: 'plug_' + data.postId + '_' + findPlug.identifier,
-      options: {
-        delay: data.delay,
-      },
-      payload: {
-        plugId: data.plugId,
-        postId: data.postId,
-        delay: data.delay,
-        totalRuns: data.totalRuns,
-        currentRun: data.currentRun + 1,
-      },
-    });
+    return false;
   }
 
   async createOrUpdatePlug(

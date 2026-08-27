@@ -4,10 +4,11 @@ import { EventEmitter } from 'events';
 import { useEffect, useState } from 'react';
 import { useVariables } from '@gitroom/react/helpers/variable.context';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
+import { ChatbaseComponent } from '@gitroom/frontend/components/layout/chatbase.component';
 export const supportEmitter = new EventEmitter();
 export const Support = () => {
   const [show, setShow] = useState(true);
-  const { discordUrl } = useVariables();
+  const { discordUrl, isChatBase } = useVariables();
   const t = useT();
 
   useEffect(() => {
@@ -16,9 +17,13 @@ export const Support = () => {
       supportEmitter.off('state', setShow);
     };
   }, []);
+  if (isChatBase) {
+    return <ChatbaseComponent />;
+  }
   if (!discordUrl || !show) return null;
   return (
     <div
+      id="support-discord"
       className="bg-customColor39 w-[194px] h-[58px] fixed end-[20px] bottom-[20px] z-[500] text-[16px] text-customColor40 rounded-[30px] !rounded-br-[0] cursor-pointer flex justify-center items-center gap-[10px]"
       onClick={() => window.open(discordUrl)}
     >

@@ -2,11 +2,16 @@
 
 import { createContext, FC, ReactNode, useContext, useEffect } from 'react';
 interface VariableContextInterface {
+  stripeClient: string;
   billingEnabled: boolean;
+  isChatBase: boolean;
   isGeneral: boolean;
   genericOauth: boolean;
   oauthLogoUrl: string;
   oauthDisplayName: string;
+  mcpUrl?: string;
+  cloudflareUrl: string;
+  mainUrl: string;
   frontEndUrl: string;
   plontoKey: string;
   storageProvider: 'local' | 'cloudflare';
@@ -17,20 +22,31 @@ interface VariableContextInterface {
   facebookPixel: string;
   telegramBotName: string;
   neynarClientId: string;
+  appleClientId: string;
   isSecured: boolean;
   disableImageCompression: boolean;
   disableXAnalytics: boolean;
   language: string;
-  tolt: string;
+  dub: boolean;
   transloadit: string[];
   sentryDsn: string;
+  extensionId: string;
+  googleAdsId?: string;
+  googleAdsTrialTracking?: string;
 }
 const VariableContext = createContext({
+  stripeClient: '',
   billingEnabled: false,
   isGeneral: true,
   genericOauth: false,
+  isChatBase: false,
   oauthLogoUrl: '',
+  googleAdsId: '',
+  googleAdsTrialTracking: '',
   oauthDisplayName: '',
+  mcpUrl: '',
+  cloudflareUrl: '',
+  mainUrl: '',
   frontEndUrl: '',
   storageProvider: 'local',
   plontoKey: '',
@@ -41,12 +57,14 @@ const VariableContext = createContext({
   telegramBotName: '',
   facebookPixel: '',
   neynarClientId: '',
+  appleClientId: '',
   disableImageCompression: false,
   disableXAnalytics: false,
   language: '',
-  tolt: '',
+  dub: false,
   transloadit: [],
   sentryDsn: '',
+  extensionId: '',
 } as VariableContextInterface);
 export const VariableContextComponent: FC<
   VariableContextInterface & {

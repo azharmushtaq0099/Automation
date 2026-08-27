@@ -6,9 +6,13 @@ import {
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import dayjs from 'dayjs';
-import { SocialAbstract } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  SocialAbstract,
+  ValidityMedia,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { InstagramDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/instagram.dto';
 import { InstagramProvider } from '@gitroom/nestjs-libraries/integrations/social/instagram.provider';
+import { META_GRAPH_API_VERSION } from '@gitroom/nestjs-libraries/integrations/social/facebook.provider';
 import { Integration } from '@prisma/client';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 
@@ -24,13 +28,14 @@ export class InstagramStandaloneProvider
   identifier = 'instagram-standalone';
   name = 'Instagram\n(Standalone)';
   isBetweenSteps = false;
+  refreshCron = true;
   scopes = [
     'instagram_business_basic',
     'instagram_business_content_publish',
     'instagram_business_manage_comments',
     'instagram_business_manage_insights',
   ];
-  override maxConcurrentJob = 10; // Instagram standalone has stricter limits
+    override maxConcurrentJob = 200; // Instagram standalone has stricter limits
   dto = InstagramDto;
 
   editor = 'normal' as const;
@@ -38,12 +43,34 @@ export class InstagramStandaloneProvider
     return 2200;
   }
 
+  override async checkValidity(
+    [firstPost]: Array<ValidityMedia[]>,
+    settings: any
+  ): Promise<string | true> {
+    if (!firstPost?.length) {
+      return 'Should have at least one media';
+    }
+    if (this.assetBoolean(settings?.is_trial_reel)) {
+      if ((firstPost?.length ?? 0) > 1) {
+        return 'Trial Reels can only have one video';
+      }
+      const hasVideo = firstPost?.some(
+        (f) => (f?.path?.indexOf?.('mp4') ?? -1) > -1
+      );
+      if (!hasVideo) {
+        return 'Trial Reels must be a video';
+      }
+    }
+    return true;
+  }
+
   public override handleErrors(
-    body: string
+    body: string,
+    status: number
   ):
     | { type: 'refresh-token' | 'bad-body' | 'retry'; value: string }
     | undefined {
-    return instagramProvider.handleErrors(body);
+    return instagramProvider.handleErrors(body, status);
   }
 
   async refreshToken(refresh_token: string): Promise<AuthTokenDetails> {
@@ -60,7 +87,7 @@ export class InstagramStandaloneProvider
       profile_picture_url = '',
     } = await (
       await fetch(
-        `https://graph.instagram.com/v21.0/me?fields=user_id,username,name,profile_picture_url&access_token=${access_token}`
+        `https://graph.instagram.com/${META_GRAPH_API_VERSION}/me?fields=user_id,username,name,profile_picture_url&access_token=${access_token}`
       )
     ).json();
 
@@ -69,7 +96,7 @@ export class InstagramStandaloneProvider
       name,
       accessToken: access_token,
       refreshToken: access_token,
-      expiresIn: dayjs().add(59, 'days').unix() - dayjs().unix(),
+      expiresIn: dayjs().add(58, 'days').unix() - dayjs().unix(),
       picture: profile_picture_url || '',
       username,
     };
@@ -135,7 +162,7 @@ export class InstagramStandaloneProvider
 
     const { user_id, name, username, profile_picture_url } = await (
       await fetch(
-        `https://graph.instagram.com/v21.0/me?fields=user_id,username,name,profile_picture_url&access_token=${access_token}`
+        `https://graph.instagram.com/${META_GRAPH_API_VERSION}/me?fields=user_id,username,name,profile_picture_url&access_token=${access_token}`
       )
     ).json();
 
@@ -144,7 +171,7 @@ export class InstagramStandaloneProvider
       name,
       accessToken: access_token,
       refreshToken: access_token,
-      expiresIn: dayjs().add(59, 'days').unix() - dayjs().unix(),
+      expiresIn: dayjs().add(58, 'days').unix() - dayjs().unix(),
       picture: profile_picture_url,
       username,
     };
@@ -165,10 +192,80 @@ export class InstagramStandaloneProvider
     );
   }
 
+  async postPending(
+    id: string,
+    accessToken: string,
+    postDetails: PostDetails<InstagramDto>[],
+    integration: Integration
+  ): Promise<PostResponse[]> {
+    return instagramProvider.postPending(
+      id,
+      accessToken,
+      postDetails,
+      integration,
+      'graph.instagram.com'
+    );
+  }
+
+  // the graph domain travels inside pendingData, so these are pure delegations
+  override async checkPostStatus(
+    accessToken: string,
+    pendingData: any,
+    integration: Integration
+  ) {
+    return instagramProvider.checkPostStatus(
+      accessToken,
+      pendingData,
+      integration
+    );
+  }
+
+  override async finalizePost(
+    accessToken: string,
+    pendingData: any,
+    integration: Integration
+  ) {
+    return instagramProvider.finalizePost(accessToken, pendingData, integration);
+  }
+
+  async comment(
+    id: string,
+    postId: string,
+    lastCommentId: string | undefined,
+    accessToken: string,
+    postDetails: PostDetails<InstagramDto>[],
+    integration: Integration
+  ): Promise<PostResponse[]> {
+    return instagramProvider.comment(
+      id,
+      postId,
+      lastCommentId,
+      accessToken,
+      postDetails,
+      integration,
+      'graph.instagram.com'
+    );
+  }
+
   async analytics(id: string, accessToken: string, date: number) {
     return instagramProvider.analytics(
       id,
       accessToken,
+      date,
+      'graph.instagram.com'
+    );
+  }
+
+  async postAnalytics(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    date: number
+  ) {
+    return instagramProvider.postAnalytics(
+      integrationId,
+      accessToken,
+      postId,
       date,
       'graph.instagram.com'
     );

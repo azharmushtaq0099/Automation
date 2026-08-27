@@ -19,7 +19,7 @@ export interface IAuthenticator {
     id: string,
     requiredId: string,
     accessToken: string
-  ): Promise<AuthTokenDetails>;
+  ): Promise<Omit<AuthTokenDetails, 'refreshToken' | 'expiresIn'>>;
   generateAuthUrl(
     clientInformation?: ClientInformation
   ): Promise<GenerateAuthUrlResponse>;
@@ -27,6 +27,12 @@ export interface IAuthenticator {
     id: string,
     accessToken: string,
     date: number
+  ): Promise<AnalyticsData[]>;
+  postAnalytics?(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    fromDate: number,
   ): Promise<AnalyticsData[]>;
   changeNickname?(
     id: string,
@@ -38,6 +44,10 @@ export interface IAuthenticator {
     accessToken: string,
     url: string
   ): Promise<{ url: string }>;
+  missing?(
+    id: string,
+    accessToken: string
+  ): Promise<{ id: string; url: string }[]>;
 }
 
 export interface AnalyticsData {
@@ -45,6 +55,7 @@ export interface AnalyticsData {
   data: Array<{ total: string; date: string }>;
   percentageChange: number;
 }
+
 
 export type GenerateAuthUrlResponse = {
   url: string;
@@ -77,14 +88,47 @@ export interface ISocialMediaIntegration {
     postDetails: PostDetails[],
     integration: Integration
   ): Promise<PostResponse[]>; // Schedules a new post
+
+  postPending?(
+    id: string,
+    accessToken: string,
+    postDetails: PostDetails[],
+    integration: Integration
+  ): Promise<PostResponse[]>; // Like `post`, but may return a `pending` response the workflow resolves via checkPostStatus / finalizePost
+
+  comment?(
+    id: string,
+    postId: string,
+    lastCommentId: string | undefined,
+    accessToken: string,
+    postDetails: PostDetails[],
+    integration: Integration
+  ): Promise<PostResponse[]>; // Schedules a new post
 }
 
 export type PostResponse = {
   id: string; // The db internal id of the post
   postId: string; // The ID of the scheduled post returned by the platform
   releaseURL: string; // The URL of the post on the platform
-  status: string; // Status of the operation or initial post status
+  status: string; // Status of the operation or initial post status, 'pending' means the workflow must poll checkPostStatus
+  pendingData?: any; // Opaque provider state used by checkPostStatus / finalizePost, never inspected by generic code
 };
+
+// Returned by checkPostStatus / finalizePost:
+// 'pending' - the platform is still processing, poll again later
+// 'ready' - processing is done, the workflow must call finalizePost to run the remaining mutations
+// 'completed' - the post is fully published
+//
+// Contract: once finalizePost's mutations have actually gone through on the
+// platform, checkPostStatus must return 'completed' - never 'ready' again -
+// otherwise a finalizePost retry after an unknown-outcome failure would re-run
+// the mutations and duplicate the post. The only exception: when finalizePost's
+// mutation is idempotent (like setting a thumbnail), returning 'ready' again is
+// allowed, since re-running it cannot duplicate anything.
+export type PendingCheckResponse =
+  | { status: 'pending'; pendingData: any }
+  | { status: 'ready'; pendingData: any }
+  | { status: 'completed'; postId: string; releaseURL: string };
 
 export type PostDetails<T = any> = {
   id: string;
@@ -107,16 +151,47 @@ export type MediaContent = {
   thumbnailTimestamp?: number;
 };
 
+export type FetchPageInformationResult = {
+  id: string;
+  name: string;
+  access_token: string;
+  picture: string;
+  username: string;
+};
+
 export interface SocialProvider
   extends IAuthenticator,
     ISocialMediaIntegration {
   identifier: string;
   refreshWait?: boolean;
   convertToJPEG?: boolean;
+  stripLinks?: () => boolean;
+  refreshCron?: boolean;
   dto?: any;
-  maxLength: (additionalSettings?: any) => number;
+  maxLength: (additionalSettings?: any, settings?: any) => number;
+  checkValidity(
+    posts: Array<{ path: string; thumbnail?: string }[]>,
+    settings: any,
+    additionalSettings: any[]
+  ): Promise<string | true>;
+  checkPostStatus(
+    accessToken: string,
+    pendingData: any,
+    integration: Integration
+  ): Promise<PendingCheckResponse>;
+  migrationMatch(
+    auth: Pick<AuthTokenDetails, 'id' | 'username'>,
+    integration: Integration
+  ): boolean;
+  finalizePost(
+    accessToken: string,
+    pendingData: any,
+    integration: Integration
+  ): Promise<PendingCheckResponse>;
   isWeb3?: boolean;
-  editor: 'normal' | 'markdown' | 'html';
+  isChromeExtension?: boolean;
+  extensionCookies?: { name: string; domain: string }[];
+  editor: 'none' | 'normal' | 'markdown' | 'html';
   customFields?: () => Promise<
     {
       key: string;
@@ -124,6 +199,7 @@ export interface SocialProvider
       defaultValue?: string;
       validation: string;
       type: 'text' | 'password';
+      hint?: string;
     }[]
   >;
   name: string;
@@ -135,7 +211,17 @@ export interface SocialProvider
     url: string
   ) => Promise<{ client_id: string; client_secret: string }>;
   mention?: (
-    token: string, data: { query: string }, id: string, integration: Integration
-  ) => Promise<{ id: string; label: string; image: string, doNotCache?: boolean }[] | {none: true}>;
+    token: string,
+    data: { query: string },
+    id: string,
+    integration: Integration
+  ) => Promise<
+    | { id: string; label: string; image: string; doNotCache?: boolean }[]
+    | { none: true }
+  >;
   mentionFormat?(idOrHandle: string, name: string): string;
+  fetchPageInformation?(
+    accessToken: string,
+    data: any
+  ): Promise<FetchPageInformationResult>;
 }

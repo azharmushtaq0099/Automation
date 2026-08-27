@@ -1,18 +1,80 @@
-import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import {
+  PrismaRepository,
+  PrismaTransaction,
+} from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { Injectable } from '@nestjs/common';
-import { Provider } from '@prisma/client';
+import { createHash } from 'crypto';
+import { Provider, Role } from '@prisma/client';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
-import { ItemsDto } from '@gitroom/nestjs-libraries/dtos/marketplace/items.dto';
-import { allTagsOptions } from '@gitroom/nestjs-libraries/database/prisma/marketplace/tags.list';
 import { UserDetailDto } from '@gitroom/nestjs-libraries/dtos/users/user.details.dto';
+import { EmailNotificationsDto } from '@gitroom/nestjs-libraries/dtos/users/email-notifications.dto';
+import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 
 @Injectable()
 export class UsersRepository {
-  constructor(private _user: PrismaRepository<'user'>) {}
+  constructor(
+    private _user: PrismaRepository<'user'>,
+    private _transaction: PrismaTransaction
+  ) {}
+
+  async switchUserCredentials(currentUserId: string, targetUserId: string) {
+    const current = await this._user.model.user.findUnique({
+      where: { id: currentUserId },
+    });
+    const target = await this._user.model.user.findUnique({
+      where: { id: targetUserId },
+    });
+
+    if (!current || !target) {
+      throw new Error('User not found');
+    }
+
+    const currentCredentials = {
+      email: current.email,
+      password: current.password,
+      providerName: current.providerName,
+      providerId: current.providerId,
+      account: current.account,
+      connectedAccount: current.connectedAccount,
+      activated: current.activated,
+    };
+    const targetCredentials = {
+      email: target.email,
+      password: target.password,
+      providerName: target.providerName,
+      providerId: target.providerId,
+      account: target.account,
+      connectedAccount: target.connectedAccount,
+      activated: target.activated,
+    };
+
+    // (email, providerName) is unique and checked per-statement, so park the
+    // current user on a throwaway email first, then fill each freed slot
+    await this._transaction.model.$transaction([
+      this._user.model.user.update({
+        where: { id: current.id },
+        data: { email: `switch-${makeId(10)}-${current.email}` },
+      }),
+      this._user.model.user.update({
+        where: { id: target.id },
+        data: currentCredentials,
+      }),
+      this._user.model.user.update({
+        where: { id: current.id },
+        data: targetCredentials,
+      }),
+    ]);
+
+    return {
+      kept: { id: current.id, email: targetCredentials.email },
+      switched: { id: target.id, email: currentCredentials.email },
+    };
+  }
 
   getImpersonateUser(name: string) {
     return this._user.model.user.findMany({
       where: {
+        deletedAt: null,
         OR: [
           {
             name: {
@@ -44,6 +106,7 @@ export class UsersRepository {
     return this._user.model.user.findFirst({
       where: {
         id,
+        deletedAt: null,
       },
     });
   }
@@ -51,8 +114,12 @@ export class UsersRepository {
   getUserByEmail(email: string) {
     return this._user.model.user.findFirst({
       where: {
-        email,
+        email: {
+          equals: email,
+          mode: 'insensitive',
+        },
         providerName: Provider.LOCAL,
+        deletedAt: null,
       },
       include: {
         picture: {
@@ -62,6 +129,25 @@ export class UsersRepository {
           },
         },
       },
+    });
+  }
+
+  getUserWithActiveSubscriptionByEmail(email: string, excludeUserId: string) {
+    return this._user.model.user.findFirst({
+      where: {
+        email,
+        id: { not: excludeUserId },
+        deletedAt: null,
+        organizations: {
+          some: {
+            role: Role.SUPERADMIN,
+            organization: {
+              subscription: { is: { deletedAt: null } },
+            },
+          },
+        },
+      },
+      select: { id: true, email: true, providerName: true },
     });
   }
 
@@ -81,6 +167,44 @@ export class UsersRepository {
       where: {
         providerId,
         providerName: provider,
+        deletedAt: null,
+      },
+    });
+  }
+
+  async deleteAccount(userId: string) {
+    const user = await this._user.model.user.findUnique({
+      where: {
+        id: userId,
+      },
+    });
+
+    if (!user || user.deletedAt) {
+      return;
+    }
+
+    const hash = (value: string) =>
+      createHash('md5').update(value).digest('hex');
+
+    // Hash the identifying fields instead of removing the row, the random
+    // suffix keeps [email, providerName] unique if the same email is deleted
+    // more than once
+    return this._user.model.user.update({
+      where: {
+        id: userId,
+      },
+      data: {
+        email: `deleted_${hash(user.email.toLowerCase())}_${makeId(5)}`,
+        password: null,
+        name: user.name ? hash(user.name) : null,
+        lastName: user.lastName ? hash(user.lastName) : null,
+        providerId: user.providerId ? hash(user.providerId) : null,
+        bio: null,
+        ip: null,
+        agent: null,
+        account: null,
+        pictureId: null,
+        deletedAt: new Date(),
       },
     });
   }
@@ -104,17 +228,6 @@ export class UsersRepository {
       },
       data: {
         audience,
-      },
-    });
-  }
-
-  changeMarketplaceActive(userId: string, active: boolean) {
-    return this._user.model.user.update({
-      where: {
-        id: userId,
-      },
-      data: {
-        marketplace: active,
       },
     });
   }
@@ -161,82 +274,29 @@ export class UsersRepository {
     });
   }
 
-  async getMarketplacePeople(orgId: string, userId: string, items: ItemsDto) {
-    const info = {
-      id: {
-        not: userId,
-      },
-      account: {
-        not: null,
-      },
-      connectedAccount: true,
-      marketplace: true,
-      items: {
-        ...(items.items.length
-          ? {
-              some: {
-                OR: items.items.map((key) => ({ key })),
-              },
-            }
-          : {
-              some: {
-                OR: allTagsOptions.map((p) => ({ key: p.key })),
-              },
-            }),
-      },
-    };
-
-    const list = await this._user.model.user.findMany({
+  async getEmailNotifications(userId: string) {
+    return this._user.model.user.findUnique({
       where: {
-        ...info,
+        id: userId,
       },
       select: {
-        id: true,
-        name: true,
-        bio: true,
-        audience: true,
-        picture: {
-          select: {
-            id: true,
-            path: true,
-          },
-        },
-        organizations: {
-          select: {
-            organization: {
-              select: {
-                Integration: {
-                  where: {
-                    disabled: false,
-                    deletedAt: null,
-                  },
-                  select: {
-                    providerIdentifier: true,
-                  },
-                },
-              },
-            },
-          },
-        },
-        items: {
-          select: {
-            key: true,
-          },
-        },
+        sendSuccessEmails: true,
+        sendFailureEmails: true,
+        sendStreakEmails: true,
       },
-      skip: (items.page - 1) * 8,
-      take: 8,
     });
+  }
 
-    const count = await this._user.model.user.count({
+  async updateEmailNotifications(userId: string, body: EmailNotificationsDto) {
+    await this._user.model.user.update({
       where: {
-        ...info,
+        id: userId,
+      },
+      data: {
+        sendSuccessEmails: body.sendSuccessEmails,
+        sendFailureEmails: body.sendFailureEmails,
+        sendStreakEmails: body.sendStreakEmails,
       },
     });
-
-    return {
-      list,
-      count,
-    };
   }
 }

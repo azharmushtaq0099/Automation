@@ -1,5 +1,5 @@
 import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
-import { Role, SubscriptionTier } from '@prisma/client';
+import { Role, ShortLinkPreference, SubscriptionTier } from '@prisma/client';
 import { Injectable } from '@nestjs/common';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
 import { CreateOrgUserDto } from '@gitroom/nestjs-libraries/dtos/auth/create.org.user.dto';
@@ -13,10 +13,50 @@ export class OrganizationRepository {
     private _user: PrismaRepository<'user'>
   ) {}
 
+  createMaxUser(id: string, name: string, saasName: string, email: string) {
+    return this._organization.model.organization.create({
+      select: {
+        id: true,
+        apiKey: true,
+      },
+      data: {
+        name: name ? `${name}###${id}` : `Unnamed User###${id}`,
+        apiKey: AuthService.fixedEncryption(makeId(20)),
+        isTrailing: false,
+        subscription: {
+          create: {
+            totalChannels: 1000000,
+            subscriptionTier: 'ULTIMATE',
+            isLifetime: true,
+            period: 'YEARLY',
+          },
+        },
+        users: {
+          create: {
+            role: Role.SUPERADMIN,
+            user: {
+              create: {
+                activated: true,
+                email: email
+                  ? email.split('@').join(`+${saasName}@`)
+                  : `${saasName}+` + makeId(10) + '@postiz.com',
+                name: name ? `${name}###${id}` : `Unnamed User###${id}`,
+                providerName: 'LOCAL',
+                password: AuthService.hashPassword(makeId(500)),
+                timezone: 0,
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
   getOrgByApiKey(api: string) {
     return this._organization.model.organization.findFirst({
       where: {
         apiKey: api,
+        deletedAt: null,
       },
       include: {
         subscription: {
@@ -32,6 +72,19 @@ export class OrganizationRepository {
 
   getCount() {
     return this._organization.model.organization.count();
+  }
+
+  getSuperAdminUser(orgId: string) {
+    return this._userOrg.model.userOrganization.findFirst({
+      where: {
+        organizationId: orgId,
+        disabled: false,
+        user: {
+          isSuperAdmin: true,
+          deletedAt: null,
+        },
+      },
+    });
   }
 
   getUserOrg(id: string) {
@@ -67,31 +120,49 @@ export class OrganizationRepository {
   getImpersonateUser(name: string) {
     return this._userOrg.model.userOrganization.findMany({
       where: {
-        user: {
-          OR: [
-            {
-              name: {
-                contains: name,
-              },
+        OR: [
+          {
+            organizationId: {
+              contains: name,
             },
-            {
-              email: {
-                contains: name,
-              },
+          },
+          {
+            user: {
+              OR: [
+                {
+                  name: {
+                    contains: name,
+                    mode: 'insensitive',
+                  },
+                },
+                {
+                  email: {
+                    contains: name,
+                    mode: 'insensitive',
+                  },
+                },
+                {
+                  id: {
+                    contains: name,
+                  },
+                },
+              ],
             },
-            {
-              id: {
-                contains: name,
-              },
-            },
-          ],
-        },
+          },
+        ],
       },
       select: {
         id: true,
+        role: true,
         organization: {
           select: {
             id: true,
+            name: true,
+            subscription: {
+              select: {
+                subscriptionTier: true,
+              },
+            },
           },
         },
         user: {
@@ -119,6 +190,7 @@ export class OrganizationRepository {
   async getOrgsByUserId(userId: string) {
     return this._organization.model.organization.findMany({
       where: {
+        deletedAt: null,
         users: {
           some: {
             userId,
@@ -151,6 +223,14 @@ export class OrganizationRepository {
     return this._organization.model.organization.findUnique({
       where: {
         id,
+      },
+    });
+  }
+
+  getUsersByEmail(email: string) {
+    return this._user.model.user.findMany({
+      where: {
+        email,
       },
     });
   }
@@ -260,6 +340,25 @@ export class OrganizationRepository {
     });
   }
 
+  async setStreak(organizationId: string, type: 'start' | 'end') {
+    try {
+      await this._organization.model.organization.update({
+        where: {
+          id: organizationId,
+          ...(type === 'start'
+            ? {
+                streakSince: null,
+              }
+            : {}),
+        },
+        data: {
+          ...(type === 'end' ? { streakSince: null } : {}),
+          ...(type === 'start' ? { streakSince: new Date() } : {}),
+        },
+      });
+    } catch (err) {}
+  }
+
   async getTeam(orgId: string) {
     return this._organization.model.organization.findUnique({
       where: {
@@ -273,6 +372,9 @@ export class OrganizationRepository {
               select: {
                 email: true,
                 id: true,
+                sendSuccessEmails: true,
+                sendFailureEmails: true,
+                sendStreakEmails: true,
               },
             },
           },
@@ -293,10 +395,23 @@ export class OrganizationRepository {
               select: {
                 email: true,
                 id: true,
+                sendSuccessEmails: true,
+                sendFailureEmails: true,
               },
             },
           },
         },
+      },
+    });
+  }
+
+  deleteOrganization(orgId: string) {
+    return this._organization.model.organization.update({
+      where: {
+        id: orgId,
+      },
+      data: {
+        deletedAt: new Date(),
       },
     });
   }
@@ -322,6 +437,28 @@ export class OrganizationRepository {
       },
       data: {
         disabled: disable,
+      },
+    });
+  }
+
+  getShortlinkPreference(orgId: string) {
+    return this._organization.model.organization.findUnique({
+      where: {
+        id: orgId,
+      },
+      select: {
+        shortlink: true,
+      },
+    });
+  }
+
+  updateShortlinkPreference(orgId: string, shortlink: ShortLinkPreference) {
+    return this._organization.model.organization.update({
+      where: {
+        id: orgId,
+      },
+      data: {
+        shortlink,
       },
     });
   }

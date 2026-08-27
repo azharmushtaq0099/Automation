@@ -6,6 +6,7 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import { CopilotChat, CopilotKitCSSProperties } from '@copilotkit/react-ui';
@@ -27,16 +28,22 @@ import {
 import { useVariables } from '@gitroom/react/helpers/variable.context';
 import { useParams } from 'next/navigation';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
-import { TextMessage } from '@copilotkit/runtime-client-gql';
+import {
+  Message as CopilotMessage,
+  TextMessage,
+} from '@copilotkit/runtime-client-gql';
 import { AddEditModal } from '@gitroom/frontend/components/new-launch/add.edit.modal';
 import dayjs from 'dayjs';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { ExistingDataContextProvider } from '@gitroom/frontend/components/launches/helpers/use.existing.data';
+import { useT } from '@gitroom/react/translation/get.transation.service.client';
+import { hasExtension } from '@gitroom/helpers/utils/has.extension';
 
 export const AgentChat: FC = () => {
   const { backendUrl } = useVariables();
   const params = useParams<{ id: string }>();
   const { properties } = useContext(PropertiesContext);
+  const t = useT();
 
   return (
     <CopilotKit
@@ -64,8 +71,8 @@ export const AgentChat: FC = () => {
           <CopilotChat
             className="w-full h-full"
             labels={{
-              title: 'Your Assistant',
-              initial: `Hello, I am your Postiz agent 🙌🏻.
+              title: t('your_assistant', 'Your Assistant'),
+              initial: t('agent_welcome_message', `Hello, I am your Postiz agent 🙌🏻.
               
 I can schedule a post or multiple posts to multiple channels and generate pictures and videos.
 
@@ -74,7 +81,7 @@ You can select the channels you want to use from the left menu.
 You can see your previous conversations from the right menu.
 
 You can also use me as an MCP Server, check Settings >> Public API
-`,
+`),
             }}
             UserMessage={Message}
             Input={NewInput}
@@ -86,28 +93,57 @@ You can also use me as an MCP Server, check Settings >> Public API
 };
 
 const LoadMessages: FC<{ id: string }> = ({ id }) => {
-  const { setMessages } = useCopilotMessagesContext();
+  const { messages, setMessages } = useCopilotMessagesContext();
   const fetch = useFetch();
+  const currentId = useRef<string | null>(null);
+  const loaded = useRef<{ id: string; messages: CopilotMessage[] } | null>(
+    null
+  );
 
   const loadMessages = useCallback(async (idToSet: string) => {
     const data = await (await fetch(`/copilot/${idToSet}/list`)).json();
-    setMessages(
-      data.uiMessages.map((p: any) => {
-        return new TextMessage({
-          content: p.content,
-          role: p.role,
-        });
-      })
-    );
+    const list = data.messages.map((p: any) => {
+      return new TextMessage({
+        content: p.content.content,
+        role: p.role,
+      });
+    });
+
+    if (currentId.current !== idToSet) {
+      return;
+    }
+
+    loaded.current = { id: idToSet, messages: list };
+    setMessages(list);
   }, []);
 
   useEffect(() => {
+    currentId.current = id;
     if (id === 'new') {
+      loaded.current = { id, messages: [] };
       setMessages([]);
       return;
     }
+    loaded.current = null;
     loadMessages(id);
   }, [id]);
+
+  // CopilotKit resolves loadAgentState to an empty list for Mastra local agents
+  // and can clobber the messages we hold, depending on which request resolves last
+  useEffect(() => {
+    if (loaded.current?.id !== id) {
+      return;
+    }
+
+    if (messages.length) {
+      loaded.current.messages = messages;
+      return;
+    }
+
+    if (loaded.current.messages.length) {
+      setMessages(loaded.current.messages);
+    }
+  }, [messages, id]);
 
   return null;
 };
@@ -159,7 +195,7 @@ const NewInput: FC<InputProps> = (props) => {
                 ? '\n[--Media--]' +
                   media
                     .map((m) =>
-                      m.path.indexOf('mp4') > -1
+                      hasExtension(m.path, 'mp4')
                         ? `Video: ${m.path}`
                         : `Image: ${m.path}`
                     )
@@ -299,7 +335,7 @@ const OpenModal: FC<{
                 integration: integration.integrationId,
                 integrationPicture:
                   properties.find((p) => p.id === integration.integrationId)
-                    .picture || '',
+                    ?.picture || '',
                 settings: integration.settings || {},
                 posts: integration.posts.map((p) => ({
                   approvedSubmitForOrder: 'NO',
